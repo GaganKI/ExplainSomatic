@@ -125,17 +125,44 @@ def extract_pileup_and_context(bam, ref, chrom, pos, ref_base,
 
 
 def build_cache(candidates_bed, bam_path, ref_path, truth_vcf_path, out_h5,
-                 label_from="truth_vcf", chunk_size=256):
+                 label_from="truth_vcf", chunk_size=256, flush_every=200):
     """label_from: 'truth_vcf' (recommended) uses the SEQC2 truth set for the
     binary label and its annotated VAF where available; falls back to the
-    observed alt allele fraction at that site for the VAF value otherwise."""
+    observed alt allele fraction at that site for the VAF value otherwise.
+
+    RESUMABLE: if out_h5 already exists (e.g. a previous run got cut off by
+    a Colab disconnect), this picks up from the last completed index instead
+    of starting over. A 'done' boolean dataset tracks progress; the file is
+    flushed to disk every `flush_every` examples so a disconnect loses at
+    most that many examples of work, not the whole run.
+    """
+    import os as _os
+
     candidates = read_candidates(candidates_bed)
+    n = len(candidates)
     truth = load_truth_set(truth_vcf_path) if truth_vcf_path else {}
     bam = pysam.AlignmentFile(bam_path, "rb", reference_filename=ref_path)
     ref = pysam.FastaFile(ref_path)
 
-    n = len(candidates)
-    with h5py.File(out_h5, "w") as h5:
+    resuming = _os.path.exists(out_h5)
+    h5 = h5py.File(out_h5, "a")  # append mode: create if missing, reuse if present
+
+    if resuming and "label" in h5:
+        existing_n = h5["label"].shape[0]
+        if existing_n != n:
+            raise ValueError(
+                f"Existing cache at {out_h5} has {existing_n} rows but the candidates "
+                f"file now has {n} -- looks like a different candidates.bed than the one "
+                f"this cache was started from. Delete the .h5 and restart, or point at the "
+                f"matching candidates file."
+            )
+        d_pileup, d_ctx = h5["pileup"], h5["context"]
+        d_label, d_vaf = h5["label"], h5["vaf"]
+        d_chrom, d_pos = h5["chrom"], h5["pos"]
+        d_done = h5["done"]
+        start_i = int(d_done[:].sum())  # done[] is written contiguously, so sum == first unfinished index
+        print(f"resuming {out_h5}: {start_i}/{n} already cached")
+    else:
         d_pileup = h5.create_dataset("pileup", shape=(n, N_CHANNELS, NUM_READS, PILEUP_WIDTH),
                                       dtype="float16", chunks=(min(chunk_size, n), N_CHANNELS, NUM_READS, PILEUP_WIDTH),
                                       compression="gzip", compression_opts=4)
@@ -146,27 +173,35 @@ def build_cache(candidates_bed, bam_path, ref_path, truth_vcf_path, out_h5,
         chrom_dt = h5py.string_dtype(encoding="utf-8")
         d_chrom = h5.create_dataset("chrom", shape=(n,), dtype=chrom_dt)
         d_pos = h5.create_dataset("pos", shape=(n,), dtype="int64")
+        d_done = h5.create_dataset("done", shape=(n,), dtype="bool")
+        start_i = 0
+        print(f"starting new cache: {out_h5}, {n} candidates")
 
-        for i, (chrom, pos, ref_base) in enumerate(candidates):
-            pileup, ctx_tokens, observed_vaf = extract_pileup_and_context(bam, ref, chrom, pos, ref_base)
-            key = (chrom, pos)
-            if key in truth:
-                label = 1.0
-                vaf = truth[key]
-            else:
-                label = 0.0
-                vaf = 0.0 if label_from == "truth_vcf" else observed_vaf
+    for i in range(start_i, n):
+        chrom, pos, ref_base = candidates[i]
+        pileup, ctx_tokens, observed_vaf = extract_pileup_and_context(bam, ref, chrom, pos, ref_base)
+        key = (chrom, pos)
+        if key in truth:
+            label = 1.0
+            vaf = truth[key]
+        else:
+            label = 0.0
+            vaf = 0.0 if label_from == "truth_vcf" else observed_vaf
 
-            d_pileup[i] = pileup.astype("float16")
-            d_ctx[i] = ctx_tokens.astype("int8")
-            d_label[i] = label
-            d_vaf[i] = vaf
-            d_chrom[i] = chrom
-            d_pos[i] = pos
+        d_pileup[i] = pileup.astype("float16")
+        d_ctx[i] = ctx_tokens.astype("int8")
+        d_label[i] = label
+        d_vaf[i] = vaf
+        d_chrom[i] = chrom
+        d_pos[i] = pos
+        d_done[i] = True
 
-            if (i + 1) % 500 == 0:
-                print(f"  cached {i+1}/{n} candidates...")
+        if (i + 1) % flush_every == 0:
+            h5.flush()
+            print(f"  cached {i+1}/{n} candidates... (flushed)")
 
+    h5.flush()
+    h5.close()
     bam.close()
     ref.close()
     print(f"done: {n} examples -> {out_h5}")

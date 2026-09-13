@@ -201,13 +201,35 @@ def build_cache(candidates_bed, bam_path, ref_path, truth_vcf_path, out_h5,
 
 
 class CachedSomaticDataset(Dataset):
-    """Fast, random-access dataset over a pre-built HDF5 cache. Opens the
-    file lazily per-worker (required for multi-worker DataLoader + h5py)."""
-    def __init__(self, h5_path):
+    """Two modes:
+
+    in_memory=True (default): loads the entire cache into RAM as plain numpy
+    arrays once, then indexes directly from memory. Strongly recommended
+    whenever the cache fits comfortably in RAM (a few GB) -- gzip-compressed
+    HDF5 chunks decompress the WHOLE chunk on any access, and with a shuffled
+    per-example DataLoader, that means near-constant chunk re-decompression
+    regardless of whether the file is local or on Drive. This is very likely
+    why training was slow even after moving files to local disk.
+
+    in_memory=False: old behaviour, lazy per-worker h5py file handle with
+    random access straight from disk. Only use this for a cache too large
+    to fit in RAM (multi-chromosome, whole-genome scale).
+    """
+    def __init__(self, h5_path, in_memory=True):
         self.h5_path = h5_path
+        self.in_memory = in_memory
         self._h5 = None
-        with h5py.File(h5_path, "r") as h5:
-            self.length = h5["label"].shape[0]
+
+        if in_memory:
+            with h5py.File(h5_path, "r") as h5:
+                self.pileup = h5["pileup"][:].astype(np.float32)
+                self.context = h5["context"][:].astype(np.int64)
+                self.label = h5["label"][:].astype(np.float32)
+                self.vaf = h5["vaf"][:].astype(np.float32)
+            self.length = len(self.label)
+        else:
+            with h5py.File(h5_path, "r") as h5:
+                self.length = h5["label"].shape[0]
 
     def _ensure_open(self):
         if self._h5 is None:
@@ -217,6 +239,11 @@ class CachedSomaticDataset(Dataset):
         return self.length
 
     def __getitem__(self, idx):
+        if self.in_memory:
+            return (torch.from_numpy(self.pileup[idx]),
+                    torch.from_numpy(self.context[idx]),
+                    torch.tensor(self.label[idx]),
+                    torch.tensor(self.vaf[idx]))
         self._ensure_open()
         pileup = torch.from_numpy(self._h5["pileup"][idx].astype(np.float32))
         ctx = torch.from_numpy(self._h5["context"][idx].astype(np.int64))

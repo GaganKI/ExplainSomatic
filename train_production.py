@@ -91,16 +91,12 @@ def metrics_at_threshold(logits, labels, vaf, threshold=0.5):
 
 def find_best_threshold(logits, labels, vaf, candidates=None):
     """Sweeps classification thresholds and returns the one maximizing
-    overall F1 on the given (validation) set. The model was trained on
-    artificially balanced batches (via --balanced_sampling) but is scored
-    against the TRUE class distribution -- a fixed 0.5 cutoff is essentially
-    arbitrary here and, empirically, made the model trigger-happy (high
-    recall, very low precision). This replaces "assume 0.5" with "measure
-    what actually works on held-out data"."""
+    overall F1 -- kept for reference/comparison, but NOT what we actually
+    calibrate against by default anymore. See find_best_threshold_recall_floor
+    below for why."""
     if candidates is None:
         probs = torch.sigmoid(logits)
         candidates = sorted(set(probs.tolist())) or [0.5]
-        # thin out if there are a huge number of unique probabilities
         if len(candidates) > 500:
             step = len(candidates) // 500
             candidates = candidates[::step]
@@ -112,6 +108,48 @@ def find_best_threshold(logits, labels, vaf, candidates=None):
         if f1 == f1 and f1 > best_f1:  # NaN-safe
             best_f1, best_t = f1, t
     return best_t, best_f1
+
+
+def find_best_threshold_recall_floor(logits, labels, vaf, min_recall=0.5, candidates=None):
+    """Maximizes PRECISION subject to RECALL >= min_recall, instead of raw F1.
+
+    Why: plain F1-maximizing calibration, tried first, pushed the threshold
+    to 0.945 and collapsed recall to 6% in exchange for a small precision
+    gain (2.1% -> 8.7%). For a clinical variant caller that's the wrong
+    tradeoff -- missing 94% of real mutations to reduce false alarms is
+    backwards; a false positive can be reviewed and discarded, a missed
+    resistance mutation means the wrong drug gets prescribed. This instead
+    asks "of all thresholds that still catch at least min_recall of real
+    variants, which has the best precision" -- a floor on recall, then
+    optimize precision within it, matching how this would actually be used
+    clinically.
+
+    Fallback: if NO threshold achieves the recall floor (possible with a
+    weak or barely-trained model), falls back to the threshold that gets
+    closest to the floor (maximizes recall), and says so explicitly rather
+    than silently returning something misleading.
+    """
+    if candidates is None:
+        probs = torch.sigmoid(logits)
+        candidates = sorted(set(probs.tolist())) or [0.5]
+        if len(candidates) > 500:
+            step = len(candidates) // 500
+            candidates = candidates[::step]
+
+    best_t, best_precision = None, -1.0
+    best_fallback_t, best_fallback_recall = 0.5, -1.0
+    for t in candidates:
+        m = metrics_at_threshold(logits, labels, vaf, threshold=t)
+        precision = m["overall"]["precision"]
+        recall = m["overall"]["recall"]
+        if recall == recall and recall > best_fallback_recall:  # track best-recall as fallback
+            best_fallback_recall, best_fallback_t = recall, t
+        if recall == recall and recall >= min_recall and precision == precision and precision > best_precision:
+            best_precision, best_t = precision, t
+
+    if best_t is not None:
+        return best_t, best_precision, True  # True = floor was actually met
+    return best_fallback_t, best_fallback_recall, False  # floor NOT met, this is best-effort
 
 
 @torch.no_grad()
@@ -156,6 +194,12 @@ def main():
                           "0.23%% rate and made it trigger-happy (high recall, terrible precision). "
                           "0.15 is a calmer middle ground -- enough positive signal to learn from "
                           "without training on a wildly unrealistic distribution.")
+    ap.add_argument("--min_recall", type=float, default=0.5,
+                     help="Calibration picks the threshold with the best PRECISION among all "
+                          "thresholds achieving at least this recall, instead of maximizing raw F1. "
+                          "For a clinical variant caller, missing real mutations is worse than a "
+                          "few false alarms, so recall is treated as a floor, not something to "
+                          "trade away for a marginal precision gain.")
     ap.add_argument("--ckpt_dir", required=True)
     ap.add_argument("--resume", action="store_true")
     args = ap.parse_args()
@@ -281,18 +325,33 @@ def main():
         best_state = torch.load(best_path, map_location=device)
         model.load_state_dict(best_state["model_state"])
         logits, labels, vaf = collect_predictions(model, val_dl, device)
-        best_threshold, best_f1 = find_best_threshold(logits, labels, vaf)
+
+        best_threshold, best_metric, floor_met = find_best_threshold_recall_floor(
+            logits, labels, vaf, min_recall=args.min_recall)
         calibrated_metrics = metrics_at_threshold(logits, labels, vaf, threshold=best_threshold)
 
-        print(f"\ncalibration: best threshold = {best_threshold:.4f} (vs. default 0.5)")
-        print(f"  at default 0.5   -> {metrics_at_threshold(logits, labels, vaf, 0.5)['overall']}")
-        print(f"  at calibrated {best_threshold:.3f} -> {calibrated_metrics['overall']}")
+        print(f"\ncalibration target: maximize precision subject to recall >= {args.min_recall:.2f} "
+              f"(NOT plain F1 -- see train_production.py docstring for why)")
+        if floor_met:
+            print(f"  recall floor was met. best threshold = {best_threshold:.4f} "
+                  f"(precision={best_metric:.4f} at this recall level)")
+        else:
+            print(f"  WARNING: no threshold reached recall >= {args.min_recall:.2f} on validation. "
+                  f"Falling back to the threshold with the highest achievable recall "
+                  f"({best_metric:.4f}) instead -- treat this run's calibration as provisional, "
+                  f"the model may need more training or more data before a {args.min_recall:.0%} "
+                  f"recall floor is realistic.")
+        print(f"  at default 0.5        -> {metrics_at_threshold(logits, labels, vaf, 0.5)['overall']}")
+        print(f"  at calibrated {best_threshold:.3f}  -> {calibrated_metrics['overall']}")
 
         best_state["calibrated_threshold"] = best_threshold
         best_state["calibrated_val_metrics"] = calibrated_metrics
+        best_state["calibration_floor_met"] = floor_met
+        best_state["min_recall_target"] = args.min_recall
         torch.save(best_state, best_path)
         with open(os.path.join(args.ckpt_dir, "calibration.json"), "w") as f:
-            json.dump({"threshold": best_threshold, "val_metrics": calibrated_metrics}, f, indent=2)
+            json.dump({"threshold": best_threshold, "min_recall_target": args.min_recall,
+                        "floor_met": floor_met, "val_metrics": calibrated_metrics}, f, indent=2)
         print(f"saved calibrated threshold + metrics to {args.ckpt_dir}/calibration.json")
     else:
         print("no best.pt was ever saved -- nothing to calibrate. "

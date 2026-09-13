@@ -106,6 +106,12 @@ def main():
     ap.add_argument("--weight_decay", type=float, default=1e-4)
     ap.add_argument("--num_workers", type=int, default=4)
     ap.add_argument("--grad_clip", type=float, default=1.0)
+    ap.add_argument("--balanced_sampling", action="store_true", default=True,
+                     help="Oversample positives during training so they actually appear in "
+                          "batches (with <0.3%% positive rate, ~86%% of batches would otherwise "
+                          "contain zero positives). Validation/test are never resampled -- they "
+                          "stay at the true class distribution so metrics remain meaningful.")
+    ap.add_argument("--no_balanced_sampling", dest="balanced_sampling", action="store_false")
     ap.add_argument("--ckpt_dir", required=True)
     ap.add_argument("--resume", action="store_true")
     args = ap.parse_args()
@@ -116,8 +122,32 @@ def main():
 
     train_ds = CachedSomaticDataset(args.train_h5)
     val_ds = CachedSomaticDataset(args.val_h5)
-    train_dl = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
-                           num_workers=args.num_workers, pin_memory=(device.type == "cuda"))
+
+    if args.balanced_sampling:
+        if hasattr(train_ds, "label"):
+            labels = train_ds.label
+        else:
+            with __import__("h5py").File(args.train_h5, "r") as _h5:
+                labels = _h5["label"][:]
+        n_pos = int((labels == 1).sum())
+        n_neg = int((labels == 0).sum())
+        print(f"train set: {n_pos} positives, {n_neg} negatives "
+              f"({100*n_pos/(n_pos+n_neg):.3f}% positive rate)")
+        # weight each example inversely to its class frequency, so a
+        # weighted random draw sees positives and negatives roughly equally
+        # often instead of positives showing up in ~14% of batches by chance
+        weight_pos = 1.0 / max(n_pos, 1)
+        weight_neg = 1.0 / max(n_neg, 1)
+        sample_weights = torch.where(torch.from_numpy(labels) == 1,
+                                      torch.full_like(torch.from_numpy(labels), weight_pos),
+                                      torch.full_like(torch.from_numpy(labels), weight_neg))
+        sampler = torch.utils.data.WeightedRandomSampler(sample_weights, num_samples=len(train_ds), replacement=True)
+        train_dl = DataLoader(train_ds, batch_size=args.batch_size, sampler=sampler,
+                               num_workers=args.num_workers, pin_memory=(device.type == "cuda"))
+    else:
+        train_dl = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
+                               num_workers=args.num_workers, pin_memory=(device.type == "cuda"))
+
     val_dl = DataLoader(val_ds, batch_size=args.batch_size, num_workers=args.num_workers)
 
     model = build_model(args.arch, args.transformer_layers).to(device)

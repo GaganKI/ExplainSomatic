@@ -45,24 +45,18 @@ def read_candidates(bed_path):
 
 
 def load_truth_set(vcf_path):
-    """Returns dict: (chrom, pos_0based) -> true_vaf (float).
-    Falls back to VAF=0.5 if the VCF doesn't carry an explicit AF/VAF INFO
-    field (e.g. a purely binary truth-call VCF) -- flag this to yourself
-    if you hit it, since it means low-VAF weighting will be less precise
-    for that subset until you pull real AFs from the SEQC2 supplementary
-    tables instead of the VCF alone."""
-    truth = {}
+    """Returns a SET of (chrom, pos_0based) for every position in the truth
+    VCF -- used ONLY to decide label (real variant or not). We deliberately
+    do NOT trust the VCF's own AF/VAF annotation for the numeric VAF value
+    anymore (real SEQC2 truth VCFs don't reliably carry it under a
+    predictable field name). Instead, build_cache() below uses the actual
+    OBSERVED alt-allele fraction computed directly from the real tumour
+    reads at that position -- which is the literal definition of VAF, and
+    doesn't depend on guessing a VCF schema at all."""
+    truth = set()
     vcf = pysam.VariantFile(vcf_path)
     for rec in vcf.fetch():
-        vaf = None
-        for key in ("VAF", "AF"):
-            if key in rec.info:
-                val = rec.info[key]
-                vaf = float(val[0] if isinstance(val, (tuple, list)) else val)
-                break
-        if vaf is None:
-            vaf = 0.5
-        truth[(rec.chrom, rec.pos - 1)] = vaf  # VCF is 1-based; we key 0-based like pysam pileup
+        truth.add((rec.chrom, rec.pos - 1))  # VCF is 1-based; we key 0-based like pysam pileup
     vcf.close()
     return truth
 
@@ -181,12 +175,11 @@ def build_cache(candidates_bed, bam_path, ref_path, truth_vcf_path, out_h5,
         chrom, pos, ref_base = candidates[i]
         pileup, ctx_tokens, observed_vaf = extract_pileup_and_context(bam, ref, chrom, pos, ref_base)
         key = (chrom, pos)
-        if key in truth:
-            label = 1.0
-            vaf = truth[key]
-        else:
-            label = 0.0
-            vaf = 0.0 if label_from == "truth_vcf" else observed_vaf
+        label = 1.0 if key in truth else 0.0
+        # VAF is always the REAL observed alt-allele fraction from the actual
+        # tumour reads at this site -- not a value trusted from the VCF's
+        # own annotation, which we no longer assume exists in any particular form.
+        vaf = observed_vaf
 
         d_pileup[i] = pileup.astype("float16")
         d_ctx[i] = ctx_tokens.astype("int8")

@@ -49,7 +49,11 @@ def build_model(arch, transformer_layers=6):
 
 
 @torch.no_grad()
-def evaluate(model, dl, device):
+def collect_predictions(model, dl, device):
+    """Runs the model once and returns raw logits/labels/vaf -- separated
+    out so we can both (a) evaluate at a fixed threshold during training,
+    and (b) sweep thresholds for calibration afterward, without a second
+    forward pass over the data."""
     model.eval()
     all_logits, all_labels, all_vaf = [], [], []
     for pileup, ctx, label, vaf in dl:
@@ -58,10 +62,11 @@ def evaluate(model, dl, device):
         all_logits.append(logit.cpu())
         all_labels.append(label)
         all_vaf.append(vaf)
-    logits = torch.cat(all_logits)
-    labels = torch.cat(all_labels)
-    vaf = torch.cat(all_vaf)
-    preds = (torch.sigmoid(logits) > 0.5).float()
+    return torch.cat(all_logits), torch.cat(all_labels), torch.cat(all_vaf)
+
+
+def metrics_at_threshold(logits, labels, vaf, threshold=0.5):
+    preds = (torch.sigmoid(logits) > threshold).float()
 
     def prf(mask):
         p, l = preds[mask], labels[mask]
@@ -80,7 +85,39 @@ def evaluate(model, dl, device):
     high_vaf_recall = preds[high_vaf_mask].mean().item() if high_vaf_mask.sum() > 0 else float("nan")
 
     return {"overall": overall, "low_vaf_recall": low_vaf_recall, "high_vaf_recall": high_vaf_recall,
-            "n_low_vaf": int(low_vaf_mask.sum()), "n_high_vaf": int(high_vaf_mask.sum())}
+            "n_low_vaf": int(low_vaf_mask.sum()), "n_high_vaf": int(high_vaf_mask.sum()),
+            "threshold": threshold}
+
+
+def find_best_threshold(logits, labels, vaf, candidates=None):
+    """Sweeps classification thresholds and returns the one maximizing
+    overall F1 on the given (validation) set. The model was trained on
+    artificially balanced batches (via --balanced_sampling) but is scored
+    against the TRUE class distribution -- a fixed 0.5 cutoff is essentially
+    arbitrary here and, empirically, made the model trigger-happy (high
+    recall, very low precision). This replaces "assume 0.5" with "measure
+    what actually works on held-out data"."""
+    if candidates is None:
+        probs = torch.sigmoid(logits)
+        candidates = sorted(set(probs.tolist())) or [0.5]
+        # thin out if there are a huge number of unique probabilities
+        if len(candidates) > 500:
+            step = len(candidates) // 500
+            candidates = candidates[::step]
+
+    best_t, best_f1 = 0.5, -1.0
+    for t in candidates:
+        m = metrics_at_threshold(logits, labels, vaf, threshold=t)
+        f1 = m["overall"]["f1"]
+        if f1 == f1 and f1 > best_f1:  # NaN-safe
+            best_f1, best_t = f1, t
+    return best_t, best_f1
+
+
+@torch.no_grad()
+def evaluate(model, dl, device, threshold=0.5):
+    logits, labels, vaf = collect_predictions(model, dl, device)
+    return metrics_at_threshold(logits, labels, vaf, threshold=threshold)
 
 
 def save_checkpoint(path, model, opt, sched, epoch, best_metric):
@@ -112,6 +149,13 @@ def main():
                           "contain zero positives). Validation/test are never resampled -- they "
                           "stay at the true class distribution so metrics remain meaningful.")
     ap.add_argument("--no_balanced_sampling", dest="balanced_sampling", action="store_false")
+    ap.add_argument("--target_positive_fraction", type=float, default=0.15,
+                     help="What fraction of each training batch should be positives, on average, "
+                          "under balanced sampling. 0.5 (the old default) made the model see "
+                          "positives and negatives equally often, which is far from the true "
+                          "0.23%% rate and made it trigger-happy (high recall, terrible precision). "
+                          "0.15 is a calmer middle ground -- enough positive signal to learn from "
+                          "without training on a wildly unrealistic distribution.")
     ap.add_argument("--ckpt_dir", required=True)
     ap.add_argument("--resume", action="store_true")
     args = ap.parse_args()
@@ -136,8 +180,8 @@ def main():
         # weight each example inversely to its class frequency, so a
         # weighted random draw sees positives and negatives roughly equally
         # often instead of positives showing up in ~14% of batches by chance
-        weight_pos = 1.0 / max(n_pos, 1)
-        weight_neg = 1.0 / max(n_neg, 1)
+        weight_pos = args.target_positive_fraction / max(n_pos, 1)
+        weight_neg = (1.0 - args.target_positive_fraction) / max(n_neg, 1)
         sample_weights = torch.where(torch.from_numpy(labels) == 1,
                                       torch.full_like(torch.from_numpy(labels), weight_pos),
                                       torch.full_like(torch.from_numpy(labels), weight_neg))
@@ -207,13 +251,52 @@ def main():
               f"[{epoch_time:.1f}s]")
 
         save_checkpoint(ckpt_path, model, opt, sched, epoch, best_low_vaf_recall)
-        if val_metrics["low_vaf_recall"] == val_metrics["low_vaf_recall"] and \
-           val_metrics["low_vaf_recall"] > best_low_vaf_recall:  # NaN-safe check
-            best_low_vaf_recall = val_metrics["low_vaf_recall"]
+        # Prefer low-VAF recall as the selection metric whenever it's actually
+        # defined (n_low_vaf > 0) -- that's the real Objective 2 metric. But
+        # right now, on chr21, val has ZERO low-VAF positives, so that metric
+        # is permanently NaN here; falling back to overall F1 in that case is
+        # what makes save-best actually produce a checkpoint at all instead of
+        # silently never saving one. Once a chromosome with low-VAF val
+        # examples is added, this automatically switches back to the real metric.
+        if val_metrics["n_low_vaf"] > 0:
+            current_score = val_metrics["low_vaf_recall"]
+        else:
+            current_score = val_metrics["overall"]["f1"]
+        if current_score == current_score and current_score > best_low_vaf_recall:  # NaN-safe
+            best_low_vaf_recall = current_score
             save_checkpoint(best_path, model, opt, sched, epoch, best_low_vaf_recall)
-            print(f"  -> new best (low_vaf_recall={best_low_vaf_recall:.4f}), saved to {best_path}")
+            fallback_note = "" if val_metrics["n_low_vaf"] > 0 else " (fallback: no low-VAF val examples yet, selected by overall F1)"
+            print(f"  -> new best (score={best_low_vaf_recall:.4f}){fallback_note}, saved to {best_path}")
 
-    print("training complete. best low-VAF recall:", best_low_vaf_recall)
+    print("training complete. best selection score:", best_low_vaf_recall)
+
+    # ---- Threshold calibration on the best checkpoint ----
+    # The model trains on artificially balanced batches (--balanced_sampling)
+    # but is scored against the true class distribution -- a fixed 0.5 cutoff
+    # is close to arbitrary here. Find the threshold that actually maximizes
+    # F1 on validation, using the BEST checkpoint, and report calibrated
+    # metrics so the number you show a panel reflects a real decision
+    # boundary, not a default that happened to ship with BCEWithLogitsLoss.
+    if os.path.exists(best_path):
+        best_state = torch.load(best_path, map_location=device)
+        model.load_state_dict(best_state["model_state"])
+        logits, labels, vaf = collect_predictions(model, val_dl, device)
+        best_threshold, best_f1 = find_best_threshold(logits, labels, vaf)
+        calibrated_metrics = metrics_at_threshold(logits, labels, vaf, threshold=best_threshold)
+
+        print(f"\ncalibration: best threshold = {best_threshold:.4f} (vs. default 0.5)")
+        print(f"  at default 0.5   -> {metrics_at_threshold(logits, labels, vaf, 0.5)['overall']}")
+        print(f"  at calibrated {best_threshold:.3f} -> {calibrated_metrics['overall']}")
+
+        best_state["calibrated_threshold"] = best_threshold
+        best_state["calibrated_val_metrics"] = calibrated_metrics
+        torch.save(best_state, best_path)
+        with open(os.path.join(args.ckpt_dir, "calibration.json"), "w") as f:
+            json.dump({"threshold": best_threshold, "val_metrics": calibrated_metrics}, f, indent=2)
+        print(f"saved calibrated threshold + metrics to {args.ckpt_dir}/calibration.json")
+    else:
+        print("no best.pt was ever saved -- nothing to calibrate. "
+              "(shouldn't happen after the fallback fix above, but flagging just in case.)")
 
 
 if __name__ == "__main__":

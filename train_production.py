@@ -65,6 +65,34 @@ def collect_predictions(model, dl, device):
     return torch.cat(all_logits), torch.cat(all_labels), torch.cat(all_vaf)
 
 
+def average_precision(logits, labels):
+    """Threshold-independent ranking quality metric (area under the
+    precision-recall curve, computed the standard rank-based way -- no
+    sklearn dependency needed). Unlike F1-at-a-fixed-threshold, this asks
+    "does the model rank real variants above non-variants in general,"
+    which doesn't fall apart when the model's probability outputs get
+    miscalibrated by overfitting (exactly what happened in this session:
+    F1-at-0.5 picked a MORE overfit epoch over a better-generalizing one).
+    Standard practice for imbalanced binary classification precisely to
+    avoid this kind of threshold-selection artifact."""
+    probs = torch.sigmoid(logits)
+    order = torch.argsort(probs, descending=True)
+    sorted_labels = labels[order]
+    n_pos = int(labels.sum().item())
+    if n_pos == 0:
+        return float("nan")
+    tp = 0
+    fp = 0
+    ap = 0.0
+    for lbl in sorted_labels.tolist():
+        if lbl == 1:
+            tp += 1
+            ap += tp / (tp + fp)
+        else:
+            fp += 1
+    return ap / n_pos
+
+
 def metrics_at_threshold(logits, labels, vaf, threshold=0.5):
     preds = (torch.sigmoid(logits) > threshold).float()
 
@@ -155,7 +183,9 @@ def find_best_threshold_recall_floor(logits, labels, vaf, min_recall=0.5, candid
 @torch.no_grad()
 def evaluate(model, dl, device, threshold=0.5):
     logits, labels, vaf = collect_predictions(model, dl, device)
-    return metrics_at_threshold(logits, labels, vaf, threshold=threshold)
+    m = metrics_at_threshold(logits, labels, vaf, threshold=threshold)
+    m["auprc"] = average_precision(logits, labels)
+    return m
 
 
 def save_checkpoint(path, model, opt, sched, epoch, best_metric):
@@ -200,6 +230,13 @@ def main():
                           "For a clinical variant caller, missing real mutations is worse than a "
                           "few false alarms, so recall is treated as a floor, not something to "
                           "trade away for a marginal precision gain.")
+    ap.add_argument("--early_stop_patience", type=int, default=3,
+                     help="Stop training if the selection metric hasn't improved for this many "
+                          "epochs in a row. Set to 0 to disable. Added after observing val recall "
+                          "decline steadily past epoch 2 while train loss kept dropping -- a "
+                          "textbook overfitting signature with only 304 unique positive training "
+                          "examples -- so running the full epoch count regardless just wastes "
+                          "compute training toward a worse checkpoint.")
     ap.add_argument("--ckpt_dir", required=True)
     ap.add_argument("--resume", action="store_true")
     args = ap.parse_args()
@@ -246,6 +283,7 @@ def main():
 
     start_epoch = 0
     best_low_vaf_recall = -1.0
+    epochs_since_improvement = 0
     ckpt_path = os.path.join(args.ckpt_dir, "last.pt")
     best_path = os.path.join(args.ckpt_dir, "best.pt")
     log_path = os.path.join(args.ckpt_dir, "log.jsonl")
@@ -289,7 +327,7 @@ def main():
             f.write(json.dumps(record) + "\n")
 
         print(f"epoch {epoch+1}/{args.epochs}  loss={avg_loss:.4f}  "
-              f"val_f1={val_metrics['overall']['f1']:.3f}  "
+              f"val_f1={val_metrics['overall']['f1']:.3f}  auprc={val_metrics['auprc']:.4f}  "
               f"low_vaf_recall={val_metrics['low_vaf_recall']:.3f} (n={val_metrics['n_low_vaf']})  "
               f"high_vaf_recall={val_metrics['high_vaf_recall']:.3f} (n={val_metrics['n_high_vaf']})  "
               f"[{epoch_time:.1f}s]")
@@ -298,19 +336,28 @@ def main():
         # Prefer low-VAF recall as the selection metric whenever it's actually
         # defined (n_low_vaf > 0) -- that's the real Objective 2 metric. But
         # right now, on chr21, val has ZERO low-VAF positives, so that metric
-        # is permanently NaN here; falling back to overall F1 in that case is
-        # what makes save-best actually produce a checkpoint at all instead of
-        # silently never saving one. Once a chromosome with low-VAF val
-        # examples is added, this automatically switches back to the real metric.
+        # is permanently NaN here. Fall back to AUPRC (not F1-at-0.5 anymore)
+        # -- AUPRC is threshold-independent, so it doesn't get fooled by an
+        # overfit epoch whose probability outputs happen to look good at
+        # exactly threshold 0.5, which is precisely what went wrong last run
+        # (F1@0.5 picked a more-overfit, worse-generalizing checkpoint).
         if val_metrics["n_low_vaf"] > 0:
             current_score = val_metrics["low_vaf_recall"]
         else:
-            current_score = val_metrics["overall"]["f1"]
+            current_score = val_metrics["auprc"]
         if current_score == current_score and current_score > best_low_vaf_recall:  # NaN-safe
             best_low_vaf_recall = current_score
             save_checkpoint(best_path, model, opt, sched, epoch, best_low_vaf_recall)
-            fallback_note = "" if val_metrics["n_low_vaf"] > 0 else " (fallback: no low-VAF val examples yet, selected by overall F1)"
+            fallback_note = "" if val_metrics["n_low_vaf"] > 0 else " (fallback: no low-VAF val examples yet, selected by AUPRC)"
             print(f"  -> new best (score={best_low_vaf_recall:.4f}){fallback_note}, saved to {best_path}")
+            epochs_since_improvement = 0
+        else:
+            epochs_since_improvement += 1
+            if args.early_stop_patience > 0 and epochs_since_improvement >= args.early_stop_patience:
+                print(f"  early stopping: no improvement for {epochs_since_improvement} epochs "
+                      f"(patience={args.early_stop_patience}). Stopping at epoch {epoch+1} "
+                      f"rather than continuing to overfit.")
+                break
 
     print("training complete. best selection score:", best_low_vaf_recall)
 
